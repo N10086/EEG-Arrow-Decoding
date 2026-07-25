@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Processing build
+build/
+build_error.txt
+build_output.txt
+build_tools/
+code/
+export/
+
+# Data files (large raw EEG data)
+stimulus_logs/
+data/
+
+# OS
+.DS_Store
+Thumbs.db

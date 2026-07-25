@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>OpenBCI EEG Viewer</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,'Microsoft YaHei',sans-serif;background:#f5f5f5;color:#333;padding:16px}
+.container{max-width:1400px;margin:0 auto}
+.card{background:#fff;border-radius:8px;padding:12px 20px;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,0.08)}
+.row{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+label.f{font-size:13px;color:#666}
+input[type=file]{font-size:13px}
+input[type=range]{width:100%;vertical-align:middle}
+#st{font-size:13px;color:#666;padding:4px 0}
+#st.err{color:#e74c3c}
+#st.ok{color:#27ae60}
+#fi{font-size:12px;color:#999;margin-left:auto}
+.win-label{font-size:12px;color:#888;font-family:Consolas,monospace;min-width:100px;text-align:center}
+</style>
+</head>
+<body>
+<div class=container>
+<div class=card>
+  <div class=row>
+    <label class=f><strong>OpenBCI ODF 文件</strong></label>
+    <input type=file id=fIn accept=.txt>
+    <span id=st>选择 .txt 文件加载</span>
+  </div>
+</div>
+<div class=card style="padding:8px 20px 14px 20px">
+  <div class=row style="margin-bottom:4px">
+    <label class=f>5 秒窗口</label>
+    <span class=win-label id=winLabel>0.0s &ndash; 5.0s</span>
+    <span id=fi></span>
+  </div>
+  <input type=range id=sl min=0 step=0.1 value=0>
+</div>
+<div id=chart class=card style="padding:4px;overflow:hidden"></div>
+</div>
+
+<script>
+// ── 滤波器系数 ──
+// 5-50 Hz Butterworth BP 4阶 SOS (scipy.signal.butter)
+// + 50 Hz notch (scipy.signal.iirnotch Q=30)
+// 格式: [b0, b1, b2, a1, a2]  (a0=1 省略)
+var SOS = [
+  // 5-50 Hz bandpass (4 sections)
+  [ 0.003362815128682,  0.006725630257365,  0.003362815128682, -1.195164462748239,  0.385402006449346],
+  [ 1,                  2,                  1,                 -1.376839008655196,  0.687349537180749],
+  [ 1,                 -2,                  1,                 -1.871076597531270,  0.876376802975341],
+  [ 1,                 -2,                  1,                 -1.955715017835739,  0.959743666947113],
+  // 50 Hz notch (1 section)
+  [ 0.989636175362892, -1.601264968233611,  0.989636175362892, -1.601264968233611,  0.979272350725784],
+];
+
+function applySOS(data) {
+  var n = data.length, buf = new Float64Array(data);
+  for (var s = 0; s < SOS.length; s++) {
+    var b0=SOS[s][0],b1=SOS[s][1],b2=SOS[s][2],a1=SOS[s][3],a2=SOS[s][4];
+    var x1=0,x2=0,y1=0,y2=0;
+    for (var i = 0; i < n; i++) {
+      var x = buf[i];
+      var y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+      x2=x1; x1=x; y2=y1; y1=y;
+      buf[i] = y;
+    }
+  }
+  return buf;
+}
+
+// ── ODF 解析 ──
+function parseODF(text) {
+  var lines = text.split(/\r?\n/);
+  var sr = 500, colNames = [], dataStart = 0, stimCol = -1, exgCols = [];
+  for (var i = 0; i < lines.length; i++) {
+    var s = lines[i].trim();
+    if (s.startsWith('%Sample Rate')) { var m = s.match(/([\d.]+)/); if (m) sr = parseFloat(m[1]); }
+    if (s.startsWith('Sample')) { colNames = s.split(',').map(function(x){return x.trim()}); dataStart = i + 1; break; }
+  }
+  if (!colNames.length) throw new Error('找不到列名');
+  for (var i = 0; i < colNames.length; i++) {
+    if (colNames[i] === 'Stimulus Marker') stimCol = i;
+    if (colNames[i].indexOf('EXG Channel') === 0) exgCols.push(i);
+  }
+  var rows = [], stim = [], ncols = 0;
+  for (var i = dataStart; i < lines.length; i++) {
+    var parts = lines[i].trim().split(',');
+    if (parts.length < 3) continue;
+    if (ncols === 0) { ncols = parts.length - 1; for (var c = 0; c < ncols; c++) rows.push([]); }
+    if (parts.length - 1 !== ncols) continue;
+    for (var j = 0; j < ncols; j++) {
+      var v = parseFloat(parts[j].trim());
+      if (isNaN(v)) continue;
+      rows[j].push(v);
+    }
+    var si = rows[0].length - 1;
+    if (stimCol >= 0 && stimCol < ncols) {
+      var mv = rows[stimCol][si];
+      if (mv >= 2.0) {
+        var num = Math.round((mv - 2.0) * 10000);
+        if (num < 1) num = Math.round(mv);
+        stim.push({ sample: si, num: num });
+      }
+    }
+  }
+  return { sr: sr, exgCols: exgCols, nSamples: rows[0].length, duration: rows[0].length / sr, data: rows, stim: stim };
+}
+
+// ── 主程序 ──
+var COLORS = ['#818181','#7C4B8D','#36579E','#317159','#E1B530','#FD5E34','#E3242B','#A25231'];
+var MNAMES = {1:'A',2:'B',3:'C',4:'D'};
+var Y_RANGE = 200;
+var WIN_SEC = 5;
+var parsed = null, chData = null, tSec = null;
+var curT0 = 0;
+
+document.getElementById('fIn').addEventListener('change', function(e) {
+  var f = e.target.files[0]; if (!f) return;
+  var st = document.getElementById('st');
+  st.textContent = '加载中...'; st.className = '';
+  var r = new FileReader();
+  r.onload = function(ev) {
+    try {
+      parsed = parseODF(ev.target.result);
+      st.textContent = '滤波中 (BP 5-50Hz + 50Hz notch)...';
+      processAll();
+      setupSlider();
+      draw();
+      st.textContent = '就绪 (' + parsed.nSamples + ' samples)';
+      st.className = 'ok';
+    } catch(e) { st.textContent = '错误: ' + e.message; st.className = 'err'; }
+  };
+  r.readAsText(f);
+});
+
+function processAll() {
+  var n = parsed.nSamples, sr = parsed.sr;
+  tSec = new Float64Array(n);
+  for (var i = 0; i < n; i++) tSec[i] = i / sr;
+  chData = [];
+  for (var ci = 0; ci < parsed.exgCols.length; ci++) {
+    var raw = parsed.data[parsed.exgCols[ci]];
+    // 去 DC（数据已是 µV）
+    var sum = 0; for (var i = 0; i < n; i++) sum += raw[i];
+    var mu = sum / n;
+    var sig = new Float64Array(n);
+    for (var i = 0; i < n; i++) sig[i] = raw[i] - mu;
+    // 级联滤波: BP + notch
+    var f = applySOS(sig);
+    // 去边缘暂态
+    var edge = Math.min(Math.floor(sr), n >> 1);
+    for (var i = 0; i < edge; i++) f[i] = 0;
+    for (var i = n - edge; i < n; i++) f[i] = 0;
+    chData.push(f);
+  }
+}
+
+function setupSlider() {
+  var dur = parsed.duration;
+  curT0 = Math.max(0, dur - WIN_SEC);
+  document.getElementById('sl').max = Math.max(0, dur - WIN_SEC);
+  document.getElementById('sl').value = curT0;
+  document.getElementById('fi').textContent =
+    chData.length + 'ch  ' + dur.toFixed(1) + 's  ' + parsed.stim.length + ' markers  |  BP 5-50Hz + 50Hz notch';
+  updateLabel();
+}
+
+function updateLabel() {
+  document.getElementById('winLabel').textContent =
+    curT0.toFixed(1) + 's – ' + (curT0 + WIN_SEC).toFixed(1) + 's';
+}
+
+document.getElementById('sl').oninput = function() {
+  curT0 = parseFloat(this.value);
+  updateLabel();
+  draw();
+};
+
+// ── Plotly 绘图 ──
+function draw() {
+  if (!parsed || !chData) return;
+  var nchan = chData.length, sr = parsed.sr;
+  var t1 = curT0 + WIN_SEC;
+
+  var wm = [];
+  for (var i = 0; i < parsed.stim.length; i++) {
+    var e = parsed.stim[i], t = e.sample / sr;
+    if (t >= curT0 && t <= t1) wm.push({ t: t, label: MNAMES[e.num] || 'M#'+e.num });
+  }
+
+  var traces = [];
+  for (var c = 0; c < nchan; c++) {
+    traces.push({
+      x: tSec, y: chData[c], type: 'scatter', mode: 'lines',
+      line: { color: COLORS[c % COLORS.length], width: 0.5 },
+      name: '' + (c + 1),
+      yaxis: 'y' + (c + 1), xaxis: 'x',
+      hoverinfo: 'skip',
+    });
+  }
+
+  var layout = {
+    title: { text: 'EEG (BP 5-50Hz + 50Hz notch)', font: { size: 13, color: '#444' } },
+    hovermode: false, dragmode: false,
+    margin: { l: 45, r: 12, t: 28, b: 40, pad: 1 },
+    height: Math.max(200, nchan * 34 + 50),
+    paper_bgcolor: '#fff', plot_bgcolor: '#fff',
+    showlegend: false,
+    xaxis: {
+      domain: [0.08, 0.98], range: [curT0, t1],
+      title: { text: 'Time (sec)', font: { size: 10, color: '#888' } },
+      tickfont: { size: 9, color: '#888' },
+      gridcolor: '#eee', zeroline: false, autorange: false,
+      fixedrange: true,
+    },
+    shapes: wm.map(function(e) {
+      return {
+        type: 'line', xref: 'x', yref: 'paper',
+        x0: e.t, y0: 0, x1: e.t, y1: 1,
+        line: { color: '#FF3333', width: 0.5 }
+      };
+    }),
+  };
+
+  for (var c = 1; c <= nchan; c++) {
+    var domTop = (nchan - c) / nchan, domBot = (nchan - c + 1) / nchan;
+    layout['yaxis' + c] = {
+      domain: [domTop, domBot], range: [-Y_RANGE, Y_RANGE],
+      tickfont: { size: 8, color: '#aaa' },
+      gridcolor: '#eee', zeroline: false,
+      showticklabels: true, side: 'left',
+      title: { text: String(c), font: { size: 8, color: COLORS[(c-1) % COLORS.length] } },
+    };
+    if (c > 1) layout['xaxis' + c] = { matches: 'x', showticklabels: false, gridcolor: '#eee', zeroline: false };
+  }
+
+  var annotations = wm.map(function(e) {
+    return {
+      x: e.t, y: 1, xref: 'x', yref: 'y1 domain',
+      text: e.label, showarrow: false,
+      font: { size: 8, color: '#FF3333' },
+      bgcolor: 'rgba(255,255,255,0.7)', borderpad: 1,
+    };
+  });
+  layout.annotations = annotations;
+
+  Plotly.newPlot('chart', traces, layout, {
+    responsive: true, displayModeBar: false, displaylogo: false,
+  });
+}
+</script>
+</body>
+</html>
